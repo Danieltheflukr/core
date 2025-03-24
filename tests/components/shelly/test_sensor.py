@@ -3,8 +3,10 @@
 from copy import deepcopy
 from unittest.mock import Mock
 
+from aioshelly.const import MODEL_BLU_GATEWAY_G3
 from freezegun.api import FrozenDateTimeFactory
 import pytest
+from syrupy import SnapshotAssertion
 
 from homeassistant.components.homeassistant import (
     DOMAIN as HA_DOMAIN,
@@ -193,9 +195,14 @@ async def test_block_restored_sleeping_sensor(
 ) -> None:
     """Test block restored sleeping sensor."""
     entry = await init_integration(hass, 1, sleep_period=1000, skip_setup=True)
-    register_device(device_registry, entry)
+    device = register_device(device_registry, entry)
     entity_id = register_entity(
-        hass, SENSOR_DOMAIN, "test_name_temperature", "sensor_0-temp", entry
+        hass,
+        SENSOR_DOMAIN,
+        "test_name_temperature",
+        "sensor_0-temp",
+        entry,
+        device_id=device.id,
     )
     extra_data = {"native_value": "20.4", "native_unit_of_measurement": "°C"}
 
@@ -226,9 +233,14 @@ async def test_block_restored_sleeping_sensor_no_last_state(
 ) -> None:
     """Test block restored sleeping sensor missing last state."""
     entry = await init_integration(hass, 1, sleep_period=1000, skip_setup=True)
-    register_device(device_registry, entry)
+    device = register_device(device_registry, entry)
     entity_id = register_entity(
-        hass, SENSOR_DOMAIN, "test_name_temperature", "sensor_0-temp", entry
+        hass,
+        SENSOR_DOMAIN,
+        "test_name_temperature",
+        "sensor_0-temp",
+        entry,
+        device_id=device.id,
     )
     monkeypatch.setattr(mock_block_device, "initialized", False)
     await hass.config_entries.async_setup(entry.entry_id)
@@ -293,9 +305,14 @@ async def test_block_not_matched_restored_sleeping_sensor(
 ) -> None:
     """Test block not matched to restored sleeping sensor."""
     entry = await init_integration(hass, 1, sleep_period=1000, skip_setup=True)
-    register_device(device_registry, entry)
+    device = register_device(device_registry, entry)
     entity_id = register_entity(
-        hass, SENSOR_DOMAIN, "test_name_temperature", "sensor_0-temp", entry
+        hass,
+        SENSOR_DOMAIN,
+        "test_name_temperature",
+        "sensor_0-temp",
+        entry,
+        device_id=device.id,
     )
     extra_data = {"native_value": "20.4", "native_unit_of_measurement": "°C"}
 
@@ -328,17 +345,92 @@ async def test_block_sensor_without_value(
     assert hass.states.get(entity_id) is None
 
 
-async def test_block_sensor_unknown_value(
-    hass: HomeAssistant, mock_block_device: Mock, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("entity", "initial_state", "block_id", "attribute", "value", "final_value"),
+    [
+        ("test_name_battery", "98", DEVICE_BLOCK_ID, "battery", None, STATE_UNKNOWN),
+        (
+            "test_name_operation",
+            "normal",
+            SENSOR_BLOCK_ID,
+            "sensorOp",
+            None,
+            STATE_UNKNOWN,
+        ),
+        (
+            "test_name_operation",
+            "normal",
+            SENSOR_BLOCK_ID,
+            "sensorOp",
+            "normal",
+            "normal",
+        ),
+        (
+            "test_name_self_test",
+            "pending",
+            SENSOR_BLOCK_ID,
+            "selfTest",
+            "completed",
+            "completed",
+        ),
+        (
+            "test_name_gas_detected",
+            "mild",
+            SENSOR_BLOCK_ID,
+            "gas",
+            "heavy",
+            "heavy",
+        ),
+    ],
+)
+async def test_block_sensor_values(
+    hass: HomeAssistant,
+    mock_block_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    entity: str,
+    initial_state: str,
+    block_id: int,
+    attribute: str,
+    value: str | None,
+    final_value: str,
 ) -> None:
     """Test block sensor unknown value."""
-    entity_id = f"{SENSOR_DOMAIN}.test_name_battery"
+    entity_id = f"{SENSOR_DOMAIN}.{entity}"
     await init_integration(hass, 1)
 
-    monkeypatch.setattr(mock_block_device.blocks[DEVICE_BLOCK_ID], "battery", None)
+    assert hass.states.get(entity_id).state == initial_state
+
+    monkeypatch.setattr(mock_block_device.blocks[block_id], attribute, value)
     mock_block_device.mock_update()
 
-    assert hass.states.get(entity_id).state == STATE_UNKNOWN
+    assert hass.states.get(entity_id).state == final_value
+
+
+@pytest.mark.parametrize(
+    ("lamp_life_seconds", "percentage"),
+    [
+        (0 * 3600, "100.0"),  # 0 hours, 100% remaining
+        (16 * 3600, "99.8222222222222"),
+        (4500 * 3600, "50.0"),  # 4500 hours, 50% remaining
+        (9000 * 3600, "0.0"),  # 9000 hours, 0% remaining
+        (10000 * 3600, "0.0"),  # > 9000 hours, 0% remaining
+    ],
+)
+async def test_block_shelly_air_lamp_life(
+    hass: HomeAssistant,
+    mock_block_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    lamp_life_seconds: int,
+    percentage: float,
+) -> None:
+    """Test block Shelly Air lamp life percentage sensor."""
+    entity_id = f"{SENSOR_DOMAIN}.{'test_name_channel_1_lamp_life'}"
+    monkeypatch.setattr(
+        mock_block_device.blocks[RELAY_BLOCK_ID], "totalWorkTime", lamp_life_seconds
+    )
+    await init_integration(hass, 1)
+
+    assert hass.states.get(entity_id).state == percentage
 
 
 async def test_rpc_sensor(
@@ -413,14 +505,16 @@ async def test_rpc_sensor_error(
 
     assert hass.states.get(entity_id).state == "4.321"
 
-    mutate_rpc_device_status(monkeypatch, mock_rpc_device, "voltmeter", "voltage", None)
+    mutate_rpc_device_status(
+        monkeypatch, mock_rpc_device, "voltmeter:100", "voltage", None
+    )
     mock_rpc_device.mock_update()
 
     assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
 
     entry = entity_registry.async_get(entity_id)
     assert entry
-    assert entry.unique_id == "123456789ABC-voltmeter-voltmeter"
+    assert entry.unique_id == "123456789ABC-voltmeter:100-voltmeter"
 
 
 async def test_rpc_polling_sensor(
@@ -489,13 +583,14 @@ async def test_rpc_restored_sleeping_sensor(
 ) -> None:
     """Test RPC restored sensor."""
     entry = await init_integration(hass, 2, sleep_period=1000, skip_setup=True)
-    register_device(device_registry, entry)
+    device = register_device(device_registry, entry)
     entity_id = register_entity(
         hass,
         SENSOR_DOMAIN,
         "test_name_temperature",
         "temperature:0-temperature_0",
         entry,
+        device_id=device.id,
     )
     extra_data = {"native_value": "21.0", "native_unit_of_measurement": "°C"}
 
@@ -527,13 +622,14 @@ async def test_rpc_restored_sleeping_sensor_no_last_state(
 ) -> None:
     """Test RPC restored sensor missing last state."""
     entry = await init_integration(hass, 2, sleep_period=1000, skip_setup=True)
-    register_device(device_registry, entry)
+    device = register_device(device_registry, entry)
     entity_id = register_entity(
         hass,
         SENSOR_DOMAIN,
         "test_name_temperature",
         "temperature:0-temperature_0",
         entry,
+        device_id=device.id,
     )
 
     monkeypatch.setattr(mock_rpc_device, "initialized", False)
@@ -689,21 +785,41 @@ async def test_block_sleeping_update_entity_service(
     )
 
 
+@pytest.mark.parametrize(
+    ("original_unit", "expected_unit"),
+    [
+        ("m/s", "m/s"),
+        (None, None),
+        ("", None),
+    ],
+)
 async def test_rpc_analog_input_sensors(
-    hass: HomeAssistant, mock_rpc_device: Mock, entity_registry: EntityRegistry
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    entity_registry: EntityRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    original_unit: str | None,
+    expected_unit: str | None,
 ) -> None:
     """Test RPC analog input xpercent sensor."""
+    config = deepcopy(mock_rpc_device.config)
+    config["input:1"]["xpercent"] = {"expr": "x*0.2995", "unit": original_unit}
+    monkeypatch.setattr(mock_rpc_device, "config", config)
+
     await init_integration(hass, 2)
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_input"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog"
     assert hass.states.get(entity_id).state == "89"
 
     entry = entity_registry.async_get(entity_id)
     assert entry
     assert entry.unique_id == "123456789ABC-input:1-analoginput"
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_value"
-    assert hass.states.get(entity_id).state == "8.9"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog_value"
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.state == "8.9"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
 
     entry = entity_registry.async_get(entity_id)
     assert entry
@@ -720,10 +836,10 @@ async def test_rpc_disabled_analog_input_sensors(
 
     await init_integration(hass, 2)
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_input"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog"
     assert hass.states.get(entity_id) is None
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_value"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog_value"
     assert hass.states.get(entity_id) is None
 
 
@@ -740,20 +856,34 @@ async def test_rpc_disabled_xpercent(
     )
     await init_integration(hass, 2)
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_input"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog"
     assert hass.states.get(entity_id).state == "89"
 
-    entity_id = f"{SENSOR_DOMAIN}.test_name_analog_value"
+    entity_id = f"{SENSOR_DOMAIN}.test_name_input_1_analog_value"
     assert hass.states.get(entity_id) is None
 
 
+@pytest.mark.parametrize(
+    ("original_unit", "expected_unit"),
+    [
+        ("l/h", "l/h"),
+        (None, None),
+        ("", None),
+    ],
+)
 async def test_rpc_pulse_counter_sensors(
     hass: HomeAssistant,
     mock_rpc_device: Mock,
     entity_registry: EntityRegistry,
     monkeypatch: pytest.MonkeyPatch,
+    original_unit: str | None,
+    expected_unit: str | None,
 ) -> None:
     """Test RPC counter sensor."""
+    config = deepcopy(mock_rpc_device.config)
+    config["input:2"]["xcounts"] = {"expr": "x/10", "unit": original_unit}
+    monkeypatch.setattr(mock_rpc_device, "config", config)
+
     await init_integration(hass, 2)
 
     entity_id = f"{SENSOR_DOMAIN}.gas_pulse_counter"
@@ -767,7 +897,10 @@ async def test_rpc_pulse_counter_sensors(
     assert entry.unique_id == "123456789ABC-input:2-pulse_counter"
 
     entity_id = f"{SENSOR_DOMAIN}.gas_counter_value"
-    assert hass.states.get(entity_id).state == "561.74"
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.state == "561.74"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
 
     entry = entity_registry.async_get(entity_id)
     assert entry
@@ -811,12 +944,27 @@ async def test_rpc_disabled_xtotal_counter(
     assert hass.states.get(entity_id) is None
 
 
+@pytest.mark.parametrize(
+    ("original_unit", "expected_unit"),
+    [
+        ("W", "W"),
+        (None, None),
+        ("", None),
+    ],
+)
 async def test_rpc_pulse_counter_frequency_sensors(
     hass: HomeAssistant,
     mock_rpc_device: Mock,
     entity_registry: EntityRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    original_unit: str | None,
+    expected_unit: str | None,
 ) -> None:
     """Test RPC counter sensor."""
+    config = deepcopy(mock_rpc_device.config)
+    config["input:2"]["xfreq"] = {"expr": "x**2", "unit": original_unit}
+    monkeypatch.setattr(mock_rpc_device, "config", config)
+
     await init_integration(hass, 2)
 
     entity_id = f"{SENSOR_DOMAIN}.gas_pulse_counter_frequency"
@@ -830,7 +978,10 @@ async def test_rpc_pulse_counter_frequency_sensors(
     assert entry.unique_id == "123456789ABC-input:2-counter_frequency"
 
     entity_id = f"{SENSOR_DOMAIN}.gas_pulse_counter_frequency_value"
-    assert hass.states.get(entity_id).state == "6.11"
+    state = hass.states.get(entity_id)
+    assert state
+    assert state.state == "6.11"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
 
     entry = entity_registry.async_get(entity_id)
     assert entry
@@ -1221,7 +1372,7 @@ async def test_rpc_rgbw_sensors(
 
     await init_integration(hass, 2)
 
-    entity_id = "sensor.test_name_power"
+    entity_id = f"sensor.test_name_{light_type}_light_0_power"
 
     state = hass.states.get(entity_id)
     assert state
@@ -1232,7 +1383,7 @@ async def test_rpc_rgbw_sensors(
     assert entry
     assert entry.unique_id == f"123456789ABC-{light_type}:0-power_{light_type}"
 
-    entity_id = "sensor.test_name_energy"
+    entity_id = f"sensor.test_name_{light_type}_light_0_energy"
 
     state = hass.states.get(entity_id)
     assert state
@@ -1243,7 +1394,7 @@ async def test_rpc_rgbw_sensors(
     assert entry
     assert entry.unique_id == f"123456789ABC-{light_type}:0-energy_{light_type}"
 
-    entity_id = "sensor.test_name_current"
+    entity_id = f"sensor.test_name_{light_type}_light_0_current"
 
     state = hass.states.get(entity_id)
     assert state
@@ -1256,7 +1407,7 @@ async def test_rpc_rgbw_sensors(
     assert entry
     assert entry.unique_id == f"123456789ABC-{light_type}:0-current_{light_type}"
 
-    entity_id = "sensor.test_name_voltage"
+    entity_id = f"sensor.test_name_{light_type}_light_0_voltage"
 
     state = hass.states.get(entity_id)
     assert state
@@ -1269,7 +1420,7 @@ async def test_rpc_rgbw_sensors(
     assert entry
     assert entry.unique_id == f"123456789ABC-{light_type}:0-voltage_{light_type}"
 
-    entity_id = "sensor.test_name_device_temperature"
+    entity_id = f"sensor.test_name_{light_type}_light_0_device_temperature"
 
     state = hass.states.get(entity_id)
     assert state
@@ -1311,3 +1462,71 @@ async def test_rpc_device_sensor_goes_unavailable_on_disconnect(
     await hass.async_block_till_done()
     temp_sensor_state = hass.states.get("sensor.test_name_temperature")
     assert temp_sensor_state.state != STATE_UNAVAILABLE
+
+
+async def test_rpc_voltmeter_value(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    entity_registry: EntityRegistry,
+) -> None:
+    """Test RPC voltmeter value sensor."""
+    entity_id = f"{SENSOR_DOMAIN}.test_name_voltmeter_value"
+
+    await init_integration(hass, 2)
+
+    state = hass.states.get(entity_id)
+
+    assert state.state == "12.34"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == "ppm"
+
+    entry = entity_registry.async_get(entity_id)
+    assert entry
+    assert entry.unique_id == "123456789ABC-voltmeter:100-voltmeter_value"
+
+
+async def test_blu_trv_sensor_entity(
+    hass: HomeAssistant,
+    mock_blu_trv: Mock,
+    entity_registry: EntityRegistry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test BLU TRV sensor entity."""
+    await init_integration(hass, 3, model=MODEL_BLU_GATEWAY_G3)
+
+    for entity in ("battery", "signal_strength", "valve_position"):
+        entity_id = f"{SENSOR_DOMAIN}.trv_name_{entity}"
+
+        state = hass.states.get(entity_id)
+        assert state == snapshot(name=f"{entity_id}-state")
+
+        entry = entity_registry.async_get(entity_id)
+        assert entry == snapshot(name=f"{entity_id}-entry")
+
+
+async def test_rpc_device_virtual_number_sensor_with_device_class(
+    hass: HomeAssistant,
+    mock_rpc_device: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a virtual number sensor with device class for RPC device."""
+    config = deepcopy(mock_rpc_device.config)
+    config["number:203"] = {
+        "name": "Current humidity",
+        "min": 0,
+        "max": 100,
+        "meta": {"ui": {"step": 1, "unit": "%", "view": "label"}},
+        "role": "current_humidity",
+    }
+    monkeypatch.setattr(mock_rpc_device, "config", config)
+
+    status = deepcopy(mock_rpc_device.status)
+    status["number:203"] = {"value": 34}
+    monkeypatch.setattr(mock_rpc_device, "status", status)
+
+    await init_integration(hass, 3)
+
+    state = hass.states.get("sensor.test_name_current_humidity")
+    assert state
+    assert state.state == "34"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == PERCENTAGE
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.HUMIDITY
